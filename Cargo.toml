@@ -7,9 +7,13 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.81"
-ffmpeg-sys-next = { version = "6.1.0", features = ["avcodec", "avformat"] }
+ffmpeg-sys-next = { version = "7.0.0" }
 livekit = { version = "0.3.2", features = ["rustls-tls-native-roots"] }
 tokio = "1.36.0"
 futures-util = "0.3.30"
 bytes = "1.6.0"
 libc = "0.2.153"
+ureq = { version = "2.9.6", features = ["json"] }
+serde = { version = "1.0.197", features = ["derive"] }
+log = "0.4.21"
+pretty_env_logger = "0.5.0"
