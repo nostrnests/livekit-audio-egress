@@ -1,10 +1,10 @@
-use std::collections::VecDeque;
 use crate::mixer::MixerData;
+use std::collections::VecDeque;
 
 pub struct SpeakerChannel {
     sid: String,
     pts: i64,
-    frames: VecDeque<MixerData>
+    frames: VecDeque<MixerData>,
 }
 
 impl SpeakerChannel {
@@ -12,7 +12,7 @@ impl SpeakerChannel {
         Self {
             sid,
             pts: 0,
-            frames: VecDeque::new()
+            frames: VecDeque::new(),
         }
     }
 

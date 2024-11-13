@@ -1,11 +1,10 @@
 use std::collections::HashMap;
-use std::ptr;
 
-use anyhow::Error;
-use ffmpeg_sys_next::{av_channel_layout_copy, av_channel_layout_default, av_dump_format, av_frame_alloc, av_interleaved_write_frame, av_opt_set, av_packet_alloc, av_packet_free, avcodec_alloc_context3, avcodec_find_encoder, avcodec_find_encoder_by_name, avcodec_parameters_from_context, avcodec_receive_packet, avcodec_send_frame, AVCodecContext, AVERROR, AVERROR_EOF, avformat_alloc_output_context2, avformat_new_stream, avformat_write_header, AVFormatContext};
-use ffmpeg_sys_next::AVCodecID::AV_CODEC_ID_AAC;
-use ffmpeg_sys_next::AVSampleFormat::AV_SAMPLE_FMT_S16;
-use libc::EAGAIN;
+use anyhow::{Error, Result};
+use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVCodecID::{AV_CODEC_ID_AAC, AV_CODEC_ID_AAC_LATM};
+use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVSampleFormat::AV_SAMPLE_FMT_S16;
+use ffmpeg_rs_raw::ffmpeg_sys_the_third::{av_frame_alloc, av_packet_free, avcodec_find_encoder_by_name};
+use ffmpeg_rs_raw::{cstr, Encoder, Muxer};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::speaker::SpeakerChannel;
@@ -16,8 +15,8 @@ pub const SAMPLE_RATE: u32 = 48_000;
 pub struct Mixer {
     id: String,
     chan_in: UnboundedReceiver<MixerData>,
-    ctx: *mut AVFormatContext,
-    codec_ctx: *mut AVCodecContext,
+    encoder: Encoder,
+    muxer: Muxer,
     speakers: HashMap<String, SpeakerChannel>,
     pts: i64,
     delay: i64,
@@ -30,75 +29,39 @@ pub struct MixerData {
 }
 
 impl Mixer {
-    pub fn new(id: String, rx: UnboundedReceiver<MixerData>) -> Self {
-        Self {
+    pub fn new(id: String, rx: UnboundedReceiver<MixerData>) -> Result<Self> {
+        let encoder = unsafe {
+            // TODO: this isnt working
+            let codec = avcodec_find_encoder_by_name(cstr!("libfdk_aac"));
+            Encoder::new(AV_CODEC_ID_AAC)?
+                .with_default_channel_layout(NB_CHANNELS as i32)
+                .with_sample_rate(SAMPLE_RATE as i32)
+                .with_sample_format(AV_SAMPLE_FMT_S16)
+                .open(None)?
+        };
+        let muxer = unsafe {
+            let mut opt = HashMap::new();
+            opt.insert("hls_flags".to_string(), "delete_segments".to_string());
+
+            Muxer::builder()
+                .with_output_path(format!("{}/live.m3u8", id).as_str(), Some("hls"), Some(opt))?
+                .with_stream_encoder(&encoder)?
+                .build()?
+        };
+
+        Ok(Self {
             id,
             chan_in: rx,
-            ctx: ptr::null_mut(),
-            codec_ctx: ptr::null_mut(),
+            encoder,
+            muxer,
             speakers: HashMap::new(),
             pts: 0,
             // audio delay in samples
-            delay: (SAMPLE_RATE as f64 * 0.01).ceil() as i64 // 10ms delay
-        }
-    }
-
-    fn setup_mixer(&mut self) -> Result<(), Error> {
-        unsafe {
-            let codec = avcodec_find_encoder_by_name("libfdk_aac\0".as_ptr() as *const libc::c_char);
-            if codec.is_null() {
-                return Err(Error::msg("Could not find encoder"));
-            }
-
-            let codec_ctx = avcodec_alloc_context3(codec);
-            if codec_ctx.is_null() {
-                return Err(Error::msg("Could not find encoder"));
-            }
-
-            (*codec_ctx).sample_rate = SAMPLE_RATE as libc::c_int;
-            (*codec_ctx).sample_fmt = AV_SAMPLE_FMT_S16;
-            av_channel_layout_default(&mut (*codec_ctx).ch_layout, NB_CHANNELS as libc::c_int);
-
-            let mut ctx = ptr::null_mut();
-            let ret = avformat_alloc_output_context2(
-                &mut ctx,
-                ptr::null(),
-                "hls\0".as_ptr() as *const libc::c_char,
-                format!("{}/live.m3u8\0", self.id).as_ptr() as *const libc::c_char,
-            );
-            if ret < 0 {
-                return Err(Error::msg("Mixer failed to init"));
-            }
-
-            av_opt_set(
-                (*ctx).priv_data,
-                "hls_flags\0".as_ptr() as *const libc::c_char,
-                "delete_segments\0".as_ptr() as *const libc::c_char,
-                0,
-            );
-
-            let stream = avformat_new_stream(ctx, ptr::null());
-            if stream == ptr::null_mut() {
-                return Err(Error::msg("Failed to add stream to output"));
-            }
-            avcodec_parameters_from_context((*stream).codecpar, codec_ctx);
-
-            av_dump_format(ctx, 0, ptr::null(), 1);
-
-            let ret = avformat_write_header(ctx, ptr::null_mut());
-            if ret < 0 {
-                return Err(Error::msg("Failed to write header"));
-            }
-            self.codec_ctx = codec_ctx;
-            self.ctx = ctx;
-        }
-        Ok(())
+            delay: (SAMPLE_RATE as f64 * 0.01).ceil() as i64, // 10ms delay
+        })
     }
 
     pub fn run(&mut self) -> Result<(), Error> {
-        if self.ctx == ptr::null_mut() {
-            self.setup_mixer()?;
-        }
         while let Ok(samples) = self.chan_in.try_recv() {
             if let Some(speaker) = self.speakers.get_mut(&samples.sid) {
                 speaker.put(samples);
@@ -114,24 +77,24 @@ impl Mixer {
 
     fn mix(&mut self) -> Result<(), Error> {
         let mut speaking = Vec::new();
-        let min_samples = self.frame_size();
+        let min_samples = unsafe { (*self.encoder.codec_context()).frame_size as i64 };
         let mut out_samples: Vec<i16> = Vec::with_capacity(min_samples as usize);
         let next_pts = self.pts + min_samples;
         if next_pts < self.delay {
             // wait for more data before starting mixer
             self.pts = next_pts;
-            return Ok(())
+            return Ok(());
         }
-        for (sid, mut speaker) in &mut self.speakers {
+        for (_sid, speaker) in &mut self.speakers {
             if let Some(next) = speaker.next_samples(next_pts) {
                 speaking.push(next);
             }
         }
         if speaking.len() == 0 {
-            return Ok(())
+            return Ok(());
         }
 
-        let x =0;
+        let x = 0;
         while x < out_samples.len() {
             let weight = 1f32 / speaking.len() as f32;
             for speaker in &mut speaking {
@@ -149,37 +112,17 @@ impl Mixer {
             (*frame).sample_rate = SAMPLE_RATE as libc::c_int;
             (*frame).format = AV_SAMPLE_FMT_S16 as libc::c_int;
             (*frame).pts = pts;
-            av_channel_layout_copy(&mut (*frame).ch_layout, &(*self.codec_ctx).ch_layout);
+            (*frame).nb_samples = data.len() as i32 / NB_CHANNELS as i32;
 
-
-            let mut ret = avcodec_send_frame(self.codec_ctx, frame);
-            if ret < 0 {
-                return Err(Error::msg("Failed to encode frame"));
-            }
-            while ret > 0 {
-                let mut pkt = av_packet_alloc();
-                ret = avcodec_receive_packet(self.codec_ctx, pkt);
-                if ret == AVERROR(EAGAIN) {
-                    av_packet_free(&mut pkt);
-                    return Ok(())
+            for mut pkt in self.encoder.encode_frame(frame)? {
+                self.muxer.write_packet(pkt)?;
+                if pkt.is_null() {
+                    break;
                 }
-                if ret == AVERROR_EOF {
-                    return Err(Error::msg("Stream ended"))
-                }
-
-                ret = av_interleaved_write_frame(self.ctx, pkt);
-                if ret < 0 {
-                    return Err(Error::msg("Failed to write pkt"))
-                }
+                av_packet_free(&mut pkt);
             }
         }
         Ok(())
-    }
-
-    fn frame_size(&mut self) -> i64 {
-        unsafe {
-            (*self.codec_ctx).frame_size as i64
-        }
     }
 }
 
